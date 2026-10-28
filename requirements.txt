@@ -1,8 +1,3 @@
 flask
 gunicorn
-torch
-transformers
-accelerate
-einops
-tiktoken
-torchaudio
+requests
