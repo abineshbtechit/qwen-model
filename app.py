@@ -6,6 +6,10 @@ app = Flask(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_FALLBACK_MODEL = os.environ.get(
+    "OPENROUTER_FALLBACK_MODEL",
+    "google/gemma-3-4b-it:free"
+)
 
 
 @app.route("/health", methods=["GET"])
@@ -15,6 +19,25 @@ def health_check():
         "inference_provider": "OpenRouter",
         "model": OPENROUTER_MODEL
     }), 200
+
+
+def extract_text(choice):
+    """Extract generated text from an OpenAI-compatible chat completion."""
+    message = choice.get("message") or {}
+    content = message.get("content")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    # Some providers return content as a list of text blocks.
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts).strip()
+
+    return ""
 
 
 @app.route("/generate", methods=["POST"])
@@ -38,63 +61,86 @@ def generate():
     except (TypeError, ValueError):
         return jsonify({"error": "'max_length' must be an integer."}), 400
 
-    # Keep requests bounded and suitable for a small free-tier API.
     max_tokens = max(1, min(max_tokens, 2048))
-
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "stream": False
-    }
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
-    try:
-        response = requests.post(
-            OPENROUTER_URL,
-            headers=headers,
-            json=payload,
-            timeout=90
-        )
+    # If the router returns an empty completion, try a second free model.
+    models_to_try = [OPENROUTER_MODEL]
+    if OPENROUTER_FALLBACK_MODEL and OPENROUTER_FALLBACK_MODEL not in models_to_try:
+        models_to_try.append(OPENROUTER_FALLBACK_MODEL)
 
-        if response.status_code >= 400:
-            try:
-                details = response.json().get("error", {}).get("message")
-            except (ValueError, AttributeError):
-                details = None
+    last_provider_status = None
+    last_error = None
 
-            if response.status_code == 429:
-                return jsonify({
-                    "error": "OpenRouter rate limit reached or the selected free model is busy. Please try again later.",
-                    "provider_status": 429
-                }), 429
+    for model in models_to_try:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt.strip()}],
+            "max_tokens": max_tokens,
+            "stream": False
+        }
+
+        try:
+            response = requests.post(
+                OPENROUTER_URL,
+                headers=headers,
+                json=payload,
+                timeout=90
+            )
+
+            if response.status_code >= 400:
+                last_provider_status = response.status_code
+                try:
+                    provider_error = response.json().get("error", {}).get("message")
+                except (ValueError, AttributeError):
+                    provider_error = None
+
+                last_error = provider_error or "The inference provider returned an error."
+
+                if response.status_code == 429:
+                    continue
+                continue
+
+            result = response.json()
+            choices = result.get("choices") or []
+            if not choices:
+                last_error = "The provider returned no choices."
+                continue
+
+            generated_text = extract_text(choices[0])
+            if not generated_text:
+                last_error = "The provider returned an empty response."
+                continue
 
             return jsonify({
-                "error": details or "The inference provider returned an error.",
-                "provider_status": response.status_code
-            }), 502
+                "response": generated_text,
+                "model": result.get("model", model)
+            }), 200
 
-        result = response.json()
-        choices = result.get("choices", [])
-        if not choices:
-            return jsonify({"error": "The inference provider returned no choices."}), 502
+        except requests.Timeout:
+            last_error = "The inference provider took too long to respond."
+            continue
+        except requests.RequestException:
+            last_error = "Could not connect to the inference provider."
+            continue
+        except (ValueError, TypeError, AttributeError):
+            last_error = "Received an invalid response from the inference provider."
+            continue
 
-        generated_text = choices[0].get("message", {}).get("content", "")
+    if last_provider_status == 429:
         return jsonify({
-            "response": generated_text,
-            "model": result.get("model", OPENROUTER_MODEL)
-        }), 200
+            "error": "OpenRouter rate limit reached or the available free models are busy. Please try again later.",
+            "provider_status": 429
+        }), 429
 
-    except requests.Timeout:
-        return jsonify({"error": "The inference provider took too long to respond. Please try again."}), 504
-    except requests.RequestException:
-        return jsonify({"error": "Could not connect to the inference provider."}), 502
-    except (ValueError, KeyError, TypeError):
-        return jsonify({"error": "Received an invalid response from the inference provider."}), 502
+    return jsonify({
+        "error": "No free model returned usable text. Please try again later.",
+        "details": last_error or "The inference provider returned no usable text.",
+        "provider_status": last_provider_status
+    }), 502
 
 
 if __name__ == "__main__":
