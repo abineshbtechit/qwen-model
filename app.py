@@ -8,7 +8,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
 OPENROUTER_FALLBACK_MODEL = os.environ.get(
     "OPENROUTER_FALLBACK_MODEL",
-    "google/gemma-3-4b-it:free"
+    "google/gemma-4-26b-a4b-it:free"
 )
 
 
@@ -29,7 +29,6 @@ def extract_text(choice):
     if isinstance(content, str):
         return content.strip()
 
-    # Some providers return content as a list of text blocks.
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -67,7 +66,7 @@ def generate():
         "Content-Type": "application/json"
     }
 
-    # If the router returns an empty completion, try a second free model.
+    # Try the free router first, then a specifically listed free model.
     models_to_try = [OPENROUTER_MODEL]
     if OPENROUTER_FALLBACK_MODEL and OPENROUTER_FALLBACK_MODEL not in models_to_try:
         models_to_try.append(OPENROUTER_FALLBACK_MODEL)
@@ -97,11 +96,7 @@ def generate():
                     provider_error = response.json().get("error", {}).get("message")
                 except (ValueError, AttributeError):
                     provider_error = None
-
                 last_error = provider_error or "The inference provider returned an error."
-
-                if response.status_code == 429:
-                    continue
                 continue
 
             result = response.json()
